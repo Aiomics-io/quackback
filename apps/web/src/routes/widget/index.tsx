@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { useQuery, keepPreviousData } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { z } from 'zod'
 import { useState, useCallback, useEffect, useMemo } from 'react'
 import { CheckCircleIcon } from '@heroicons/react/24/solid'
@@ -177,19 +177,29 @@ function WidgetPage() {
   // feed gates votes/submission per the actual actor instead of OR-ing in a
   // blanket isIdentified (which advertised CTAs on segments/team boards the
   // actor cannot act on). Seeded with the loader map so SSR + first paint match.
-  const { data: livePermissions } = useQuery({
-    queryKey: ['widget', 'boardPermissions', sessionVersion],
+  //
+  // The board LIST is refetched with it (backport of upstream #531): the SSR
+  // seed only holds boards an anonymous visitor can see, so a members-only
+  // board would otherwise never appear after identify and Submit stays off.
+  const { data: liveCapabilities } = useQuery({
+    queryKey: ['widget', 'boardCapabilities', sessionVersion],
     queryFn: () => fetchBoardCapabilitiesFn({ headers: getWidgetAuthHeaders() }),
     // Seed ONLY the initial (anonymous, SSR) key from the loader. initialData
     // stamps an entry fresh as of now, so seeding it on every key would also
     // mark the post-identify key fresh and suppress the Bearer refetch within
     // staleTime — leaving an identified viewer stuck on the anonymous baseline.
-    // After identify the key changes, carries no initialData, and refetches with
-    // the Bearer while keepPreviousData shows the prior map meanwhile.
-    initialData: sessionVersion === INITIAL_SESSION_VERSION ? boardPermissions : undefined,
-    placeholderData: keepPreviousData,
+    // After identify the key changes, carries no initialData, and refetches
+    // with the Bearer. Do not keepPreviousData — logout/switch would otherwise
+    // show the prior visitor's members-only boards until the new fetch lands.
+    // Missing data falls back to the anonymous SSR `boards` list.
+    initialData:
+      sessionVersion === INITIAL_SESSION_VERSION
+        ? { permissions: boardPermissions, boards }
+        : undefined,
     staleTime: 30 * 1000,
   })
+  const livePermissions = liveCapabilities?.permissions
+  const liveBoards = liveCapabilities?.boards ?? boards
 
   const { c: resumeConversationId } = Route.useSearch()
   const initialTab = resolveInitialTab(tabs)
@@ -440,7 +450,7 @@ function WidgetPage() {
           initialPosts={allPosts}
           initialHasMore={postsHasMore}
           statuses={statuses}
-          boards={boards}
+          boards={liveBoards}
           boardPermissions={livePermissions}
           defaultBoard={defaultBoard}
           onPostSelect={handlePostSelect}

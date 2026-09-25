@@ -23,6 +23,8 @@ import { useInfiniteScroll } from '@/lib/client/hooks/use-infinite-scroll'
 import { WidgetVoteButton } from './widget-vote-button'
 import { useWidgetAuth } from './widget-auth-provider'
 import { sendToHost } from '@/lib/client/widget-bridge'
+import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
+import { INITIAL_SESSION_VERSION } from '@/lib/client/hooks/use-widget-vote'
 import type { PostId } from '@quackback/ids'
 import { RichTextEditor } from '@/components/ui/rich-text-editor'
 import { useWidgetImageUpload } from '@/lib/client/hooks/use-image-upload'
@@ -193,6 +195,7 @@ export function WidgetHomeAnimated({
     emitEvent,
     metadata,
     identifyWithEmail,
+    sessionVersion,
   } = useWidgetAuth()
   const { upload: uploadImage } = useWidgetImageUpload()
   const inputRef = useRef<HTMLInputElement>(null)
@@ -209,6 +212,17 @@ export function WidgetHomeAnimated({
     if (boards.length === 1) return boards[0].id
     return ''
   })
+  // The board list can change after mount: the widget route refetches it with
+  // the Bearer identity once identify lands, surfacing members-only boards the
+  // anonymous SSR seed omitted. The initializer above only saw the seed, so
+  // re-resolve whenever the current selection is no longer in the list (aiomics
+  // patch on 0.13.2; upstream fixed this in #531/#577).
+  useEffect(() => {
+    if (selectedBoardId && boards.some((b) => b.id === selectedBoardId)) return
+    const match = defaultBoard ? boards.find((b) => b.slug === defaultBoard) : undefined
+    const next = match ? match.id : boards.length === 1 ? boards[0].id : ''
+    if (next !== selectedBoardId) setSelectedBoardId(next)
+  }, [boards, defaultBoard, selectedBoardId])
   const [contentJson, setContentJson] = useState<JSONContent | null>(null)
   const [contentHtml, setContentHtml] = useState('')
   const handleEditorChange = useCallback((json: JSONContent, html: string) => {
@@ -260,7 +274,9 @@ export function WidgetHomeAnimated({
     isFetchingNextPage,
     isFetching: isFetchingPosts,
   } = useInfiniteQuery({
-    queryKey: ['widget', 'posts', 'popular', 'top', activeBoardSlug ?? 'all'],
+    // Keyed on sessionVersion and sent with the Bearer so an identified viewer
+    // sees posts on boards the anonymous SSR seed could not (aiomics patch).
+    queryKey: ['widget', 'posts', 'popular', 'top', activeBoardSlug ?? 'all', sessionVersion],
     queryFn: ({ pageParam }) =>
       listPublicPostsFn({
         data: {
@@ -269,12 +285,13 @@ export function WidgetHomeAnimated({
           limit: 20,
           boardSlug: activeBoardSlug ?? undefined,
         },
+        headers: getWidgetAuthHeaders(),
       }),
     initialPageParam: 1,
     getNextPageParam: (lastPage, allPages) => (lastPage.hasMore ? allPages.length + 1 : undefined),
-    // Only seed from SSR data on the initial unfiltered view
+    // Only seed from SSR data on the initial unfiltered, anonymous view
     initialData:
-      activeBoardSlug === null
+      activeBoardSlug === null && sessionVersion === INITIAL_SESSION_VERSION
         ? {
             pages: [{ items: initialPosts, total: -1, hasMore: initialHasMore }],
             pageParams: [1],
@@ -307,11 +324,18 @@ export function WidgetHomeAnimated({
 
   // Search query for popular ideas — replaces infinite list when active
   const { data: popularSearchData, isFetching: isPopularSearchFetching } = useQuery({
-    queryKey: ['widget', 'search', 'popular', debouncedPopularSearch, activeBoardSlug ?? 'all'],
+    queryKey: [
+      'widget',
+      'search',
+      'popular',
+      debouncedPopularSearch,
+      activeBoardSlug ?? 'all',
+      sessionVersion,
+    ],
     queryFn: async () => {
       const params = new URLSearchParams({ q: debouncedPopularSearch, limit: '20' })
       if (activeBoardSlug) params.set('board', activeBoardSlug)
-      const res = await fetch(`/api/widget/search?${params}`)
+      const res = await fetch(`/api/widget/search?${params}`, { headers: getWidgetAuthHeaders() })
       const json = await res.json()
       return { posts: (json.data?.posts ?? []) as WidgetPost[] }
     },
@@ -347,7 +371,8 @@ export function WidgetHomeAnimated({
       setIsSimilarSearching(false)
       return
     }
-    const cached = similarSearchCache.get(q)
+    const cacheKey = `${sessionVersion}:${q}`
+    const cached = similarSearchCache.get(cacheKey)
     if (cached) {
       setSimilarPostResults(cached)
       setIsSimilarSearching(false)
@@ -358,10 +383,13 @@ export function WidgetHomeAnimated({
     similarDebounceRef.current = setTimeout(async () => {
       try {
         const params = new URLSearchParams({ q, limit: '5' })
-        const res = await fetch(`/api/widget/search?${params}`, { signal: controller.signal })
+        const res = await fetch(`/api/widget/search?${params}`, {
+          signal: controller.signal,
+          headers: getWidgetAuthHeaders(),
+        })
         const json = await res.json()
         const result: SearchResult = { posts: json.data?.posts ?? [] }
-        similarSearchCache.set(q, result)
+        similarSearchCache.set(cacheKey, result)
         setSimilarPostResults(result)
       } catch (err) {
         if (err instanceof Error && err.name === 'AbortError') return
@@ -374,7 +402,7 @@ export function WidgetHomeAnimated({
       if (similarDebounceRef.current) clearTimeout(similarDebounceRef.current)
       controller.abort()
     }
-  }, [title])
+  }, [title, sessionVersion])
 
   // Debounce popular ideas search
   useEffect(() => {
@@ -432,14 +460,11 @@ export function WidgetHomeAnimated({
         // the now-Bearer identity before posting, so we surface a clear
         // no-access message instead of firing a createPost the server rejects
         // (#191). The feed's boardPermissions also refetches on sessionVersion.
-        const [{ getWidgetAuthHeaders }, { fetchBoardCapabilitiesFn }] = await Promise.all([
-          import('@/lib/client/widget-auth'),
-          import('@/lib/server/functions/portal'),
-        ])
-        const freshPermissions = await fetchBoardCapabilitiesFn({
+        const { fetchBoardCapabilitiesFn } = await import('@/lib/server/functions/portal')
+        const fresh = await fetchBoardCapabilitiesFn({
           headers: getWidgetAuthHeaders(),
         })
-        if (!freshPermissions?.[selectedBoardId]?.canSubmit) {
+        if (!fresh?.permissions?.[selectedBoardId]?.canSubmit) {
           setError(
             intl.formatMessage({
               id: 'widget.home.form.noAccess',
@@ -482,10 +507,7 @@ export function WidgetHomeAnimated({
         }
       }
 
-      const [{ getWidgetAuthHeaders }, { createPublicPostFn }] = await Promise.all([
-        import('@/lib/client/widget-auth'),
-        import('@/lib/server/functions/public-posts'),
-      ])
+      const { createPublicPostFn } = await import('@/lib/server/functions/public-posts')
       const result = await createPublicPostFn({
         data: {
           boardId: selectedBoardId,

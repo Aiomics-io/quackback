@@ -718,7 +718,7 @@ export const fetchBoardCapabilitiesFn = createServerFn({ method: 'GET' }).handle
 
   // Same portal-visibility + per-board gates as fetchPortalData.
   const access = await resolvePortalAccessForRequest()
-  if (!access.granted) return empty
+  if (!access.granted) return { permissions: empty, boards: [] as WidgetVisibleBoard[] }
 
   const auth = await getOptionalAuth()
   const actor = await policyActorFromAuth(auth)
@@ -729,5 +729,19 @@ export const fetchBoardCapabilitiesFn = createServerFn({ method: 'GET' }).handle
     listPublicBoardsWithStats(actor),
     loadAllowAnonymous(),
   ])
-  return buildBoardPermissions(actor, boards, allowAnonymous)
+  return {
+    permissions: await buildBoardPermissions(actor, boards, allowAnonymous),
+    // Same visitor-visible list as the permissions map, so identify can
+    // surface members-only boards the anonymous SSR seed omitted.
+    // Backport of upstream #531 (aiomics patch on 0.13.2).
+    boards: boards.map(
+      (board): WidgetVisibleBoard => ({
+        id: String(board.id),
+        name: board.name,
+        slug: board.slug,
+      })
+    ),
+  }
 })
+
+export type WidgetVisibleBoard = { id: string; name: string; slug: string }

@@ -332,31 +332,49 @@ describe('portal.ts fetchBoardCapabilitiesFn — per-board capability map', () =
   }
   const authAccess = { ...anonAccess, vote: 'authenticated', submit: 'authenticated' }
 
-  it('returns an empty map when the private portal blocks the caller', async () => {
+  it('returns an empty map and no boards when the private portal blocks the caller', async () => {
     mockResolvePortalAccess.mockResolvedValue({ granted: false, reason: 'unauthorized' })
     const h = await loadModule(PORTAL)
     const result = await h[FETCH_BOARD_CAPABILITIES]({ data: {} })
-    expect(result).toEqual({})
+    expect(result).toEqual({ permissions: {}, boards: [] })
     expect(mockListPublicBoardsWithStats).not.toHaveBeenCalled()
   })
 
   it('maps each visible board to its submit/vote capability for the actor', async () => {
     mockResolvePortalAccess.mockResolvedValue({ granted: true, reason: 'public' })
     mockListPublicBoardsWithStats.mockResolvedValue([
-      { id: 'board_pub', access: anonAccess },
-      { id: 'board_auth', access: authAccess },
+      { id: 'board_pub', name: 'Ideas', slug: 'ideas', access: anonAccess },
+      { id: 'board_auth', name: 'Bug Reports', slug: 'bug-reports', access: authAccess },
     ])
     const h = await loadModule(PORTAL)
-    const result = (await h[FETCH_BOARD_CAPABILITIES]({ data: {} })) as Record<
-      string,
-      { canSubmit: boolean; canVote: boolean }
-    >
+    const result = (await h[FETCH_BOARD_CAPABILITIES]({ data: {} })) as {
+      permissions: Record<string, { canSubmit: boolean; canVote: boolean }>
+      boards: Array<{ id: string; name: string; slug: string }>
+    }
     // Anonymous actor (mocked) + workspace allowAnonymous=true: the all-anonymous
     // board is actionable, the sign-in-required board is not.
-    expect(result).toEqual({
+    expect(result.permissions).toEqual({
       board_pub: { canSubmit: true, canVote: true },
       board_auth: { canSubmit: false, canVote: false },
     })
+  })
+
+  // aiomics patch: the widget replaces its anonymous SSR board list with this
+  // one after identify, so it must carry every board the actor can see.
+  it('returns the actor-visible board list alongside the permissions', async () => {
+    mockResolvePortalAccess.mockResolvedValue({ granted: true, reason: 'public' })
+    mockListPublicBoardsWithStats.mockResolvedValue([
+      { id: 'board_pub', name: 'Ideas', slug: 'ideas', access: anonAccess },
+      { id: 'board_auth', name: 'Bug Reports', slug: 'bug-reports', access: authAccess },
+    ])
+    const h = await loadModule(PORTAL)
+    const result = (await h[FETCH_BOARD_CAPABILITIES]({ data: {} })) as {
+      boards: Array<{ id: string; name: string; slug: string }>
+    }
+    expect(result.boards).toEqual([
+      { id: 'board_pub', name: 'Ideas', slug: 'ideas' },
+      { id: 'board_auth', name: 'Bug Reports', slug: 'bug-reports' },
+    ])
   })
 })
 
