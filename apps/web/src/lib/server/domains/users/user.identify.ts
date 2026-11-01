@@ -30,6 +30,22 @@ import {
 } from './user.attributes'
 
 /**
+ * `metadata` with `removals` deleted and `updates` merged over the rest.
+ *
+ * The removal keys go in as an explicit `ARRAY[...]::text[]`: Drizzle's `sql`
+ * template flattens a bare JS array into a parenthesised parameter list, so
+ * `${keys}::text[]` rendered as `()::text[]` (a syntax error) for no removals
+ * and `($1)::text[]` (a malformed array literal) for some.
+ */
+function mergedMetadataSql(removals: string[], updates: Record<string, unknown>) {
+  const removalArray = sql`ARRAY[${sql.join(
+    removals.map((key) => sql`${key}`),
+    sql`, `
+  )}]::text[]`
+  return sql`((coalesce(nullif(${user.metadata}, ''), '{}')::jsonb - ${removalArray}) || ${JSON.stringify(updates)}::jsonb)::text`
+}
+
+/**
  * Identify (create or update) a portal user by email.
  *
  * - If the user exists: update name, image, emailVerified, and merge attributes.
@@ -78,7 +94,7 @@ export async function identifyPortalUser(
       }
     }
     if (Object.keys(metadataUpdates).length > 0 || metadataRemovals.length > 0) {
-      userUpdates.metadata = sql`((coalesce(nullif(${user.metadata}, ''), '{}')::jsonb - ${metadataRemovals}::text[]) || ${JSON.stringify(metadataUpdates)}::jsonb)::text`
+      userUpdates.metadata = mergedMetadataSql(metadataRemovals, metadataUpdates)
     }
 
     if (Object.keys(userUpdates).length > 0) {
@@ -254,7 +270,7 @@ export async function updatePortalUser(
     }
   }
   if (Object.keys(metadataUpdates).length > 0 || metadataRemovals.length > 0) {
-    userUpdates.metadata = sql`((coalesce(nullif(${user.metadata}, ''), '{}')::jsonb - ${metadataRemovals}::text[]) || ${JSON.stringify(metadataUpdates)}::jsonb)::text`
+    userUpdates.metadata = mergedMetadataSql(metadataRemovals, metadataUpdates)
   }
 
   if (Object.keys(userUpdates).length > 0) {
