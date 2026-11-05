@@ -10,10 +10,10 @@
  * the common transient provider failure into a success rather than a log line
  * nobody reads. A send that exhausts the retries is still only logged.
  *
- *  - Visitor message  -> email the team only when no agent currently has a
- *    live stream (offline coverage). The in-app team bell for the same
- *    event rides the message.created event/hook pipeline instead (WO-3
- *    slice 5) — see notifyVisitorMessage's own doc.
+ *  - Visitor message  -> email each teammate whose own "New message" email
+ *    preference is on, whether or not anyone is online. The in-app team bell
+ *    for the same event rides the message.created event/hook pipeline instead
+ *    (WO-3 slice 5) — see notifyVisitorMessage's own doc.
  *  - Agent reply      -> email the visitor when they're reachable AND either
  *    offline OR on an EMAIL conversation. Presence gates the messenger surface
  *    only: on an email thread the mailbox IS the thread, so a live stream
@@ -47,7 +47,7 @@ import type { ConversationId, ConversationMessageId, PrincipalId } from '@quackb
 import type { JSONContent } from '@tiptap/core'
 import { generateContentHTML } from '@/lib/shared/content-html'
 import { withEmailProxyHint } from '@/lib/server/content/email-image-proxy'
-import { isAnyAgentOnline, isPrincipalOnline } from '@/lib/server/realtime/presence'
+import { isPrincipalOnline } from '@/lib/server/realtime/presence'
 import { buildHookContext } from '@/lib/server/events/hook-context'
 import { truncate } from '@/lib/shared/utils/string'
 import { resolveReplyRecipient } from './conversation.recipient'
@@ -238,10 +238,16 @@ async function resolveVisitorConversationLink(
 }
 
 /**
- * Email the team of a new visitor message when no agent is online to see it
- * live. The in-app team bell for the same event moved to the
- * `message.created` event/hook pipeline (WO-3 slice 5, notificationHook in
- * events/handlers/notification.ts) — this function is now email-only.
+ * Email each teammate of a new visitor message, per their own "New message"
+ * (`chat_message`) email preference. The in-app team bell for the same event
+ * moved to the `message.created` event/hook pipeline (WO-3 slice 5,
+ * notificationHook in events/handlers/notification.ts) — this function is now
+ * email-only.
+ *
+ * Not gated on presence: "someone on the team has an admin tab open" says
+ * nothing about whether THIS teammate saw the message, and the old global gate
+ * silently suppressed the email for everyone. A teammate who works from the
+ * inbox and does not want the mail turns the preference off.
  */
 export async function notifyVisitorMessage(opts: {
   conversation: Conversation
@@ -254,21 +260,7 @@ export async function notifyVisitorMessage(opts: {
   attachments?: ConversationAttachment[]
 }): Promise<void> {
   try {
-    const agentsOnline = await isAnyAgentOnline()
-    // Avoid email spam: only email the team on the first message of a
-    // conversation, or when nobody is around to see it live. This gate is
-    // redundant with the `!agentsOnline` check below for every case except
-    // the fast escape it buys (skip the team query entirely) — kept exactly
-    // as it was before the bell moved out, to not perturb email behavior.
-    //
-    // Deliberate small skew: presence is now checked at TWO different
-    // moments — here, at request time, for the email; and again inside the
-    // notification hook, at worker time, for the bell (its own anti-spam
-    // gate: `!cfg.isFirstMessage && isAnyAgentOnline()`). Never try to unify
-    // them — the bell's check intentionally runs later, off the request path.
-    if (!opts.isFirstMessage && agentsOnline) return
-
-    const team = await db
+    const teamRows = await db
       .select({
         principalId: principal.id,
         email: user.email,
@@ -279,58 +271,68 @@ export async function notifyVisitorMessage(opts: {
       .leftJoin(user, eq(principal.userId, user.id))
       .where(and(eq(principal.type, 'user'), inArray(principal.role, ['admin', 'member'])))
 
+    if (teamRows.length === 0) return
+
+    const [{ batchGetNotificationPreferences }, { shouldNotify }] = await Promise.all([
+      import('@/lib/server/domains/subscriptions/subscription.service'),
+      import('@/lib/server/domains/subscriptions/notification-matrix'),
+    ])
+    const prefs = await batchGetNotificationPreferences(
+      teamRows.map((t) => t.principalId as PrincipalId)
+    )
+    const team = teamRows.filter((t) => {
+      const p = prefs.get(t.principalId as PrincipalId)
+      return !p || shouldNotify(p, 'chat_message', 'email')
+    })
     if (team.length === 0) return
 
     const body = previewOf(opts.content)
 
-    // Email the team only when no agent is online to handle it live.
-    if (!agentsOnline) {
-      const ctx = await buildHookContext()
-      if (!ctx) return
-      const ctaUrl = `${ctx.portalBaseUrl.replace(/\/$/, '')}/admin/inbox?i=${opts.conversation.id}`
-      const { sendConversationMessageEmail } = await import('@quackback/email')
-      const { teamThreadRootMessageId, mintTeamOutboundMessageId } =
-        await import('@/lib/server/domains/conversation/conversation.email-channel')
-      const teamRoot = teamThreadRootMessageId(opts.conversation.id)
-      // Contact class: the only link is an /admin/inbox URL, which carries no
-      // capability — the session does. So a teammate reachable only via their
-      // contact address is correctly included, which the old truthiness filter
-      // on the account address would have dropped.
-      // Both address fields came back with the team query, so the recipient is
-      // decided from rows already in hand rather than by a second round trip.
-      const { contactRecipientFrom, mailContact } = await import('@/lib/server/email/recipient')
-      const resolvedBody = await resolvedMessageBody(
-        opts.content,
-        opts.contentJson,
-        opts.attachments,
-        { trustedSender: await isVerifiedVisitorSender(opts.conversation) }
-      )
-      await Promise.allSettled(
-        team
-          .flatMap((t) => {
-            const to = contactRecipientFrom({ accountEmail: t.email, contactEmail: t.contactEmail })
-            return to ? [{ ...t, to }] : []
+    const ctx = await buildHookContext()
+    if (!ctx) return
+    const ctaUrl = `${ctx.portalBaseUrl.replace(/\/$/, '')}/admin/inbox?i=${opts.conversation.id}`
+    const { sendConversationMessageEmail } = await import('@quackback/email')
+    const { teamThreadRootMessageId, mintTeamOutboundMessageId } =
+      await import('@/lib/server/domains/conversation/conversation.email-channel')
+    const teamRoot = teamThreadRootMessageId(opts.conversation.id)
+    // Contact class: the only link is an /admin/inbox URL, which carries no
+    // capability — the session does. So a teammate reachable only via their
+    // contact address is correctly included, which the old truthiness filter
+    // on the account address would have dropped.
+    // Both address fields came back with the team query, so the recipient is
+    // decided from rows already in hand rather than by a second round trip.
+    const { contactRecipientFrom, mailContact } = await import('@/lib/server/email/recipient')
+    const resolvedBody = await resolvedMessageBody(
+      opts.content,
+      opts.contentJson,
+      opts.attachments,
+      { trustedSender: await isVerifiedVisitorSender(opts.conversation) }
+    )
+    await Promise.allSettled(
+      team
+        .flatMap((t) => {
+          const to = contactRecipientFrom({ accountEmail: t.email, contactEmail: t.contactEmail })
+          return to ? [{ ...t, to }] : []
+        })
+        .map((t) =>
+          mailContact(sendConversationMessageEmail, t.to, {
+            direction: 'visitor_message',
+            senderName: opts.authorName,
+            messagePreview: body,
+            bodyHtml: resolvedBody.bodyHtml,
+            attachments: resolvedBody.attachments,
+            ctaUrl,
+            workspaceName: ctx.workspaceName,
+            logoUrl: ctx.logoUrl ?? undefined,
+            isFirstMessage: opts.isFirstMessage,
+            conversationSubject: opts.conversation.subject,
+            messageId: mintTeamOutboundMessageId(opts.conversation.id) ?? undefined,
+            inReplyTo: teamRoot ?? undefined,
+            references: teamRoot ? [teamRoot] : undefined,
+            conversationId: opts.conversation.id,
           })
-          .map((t) =>
-            mailContact(sendConversationMessageEmail, t.to, {
-              direction: 'visitor_message',
-              senderName: opts.authorName,
-              messagePreview: body,
-              bodyHtml: resolvedBody.bodyHtml,
-              attachments: resolvedBody.attachments,
-              ctaUrl,
-              workspaceName: ctx.workspaceName,
-              logoUrl: ctx.logoUrl ?? undefined,
-              isFirstMessage: opts.isFirstMessage,
-              conversationSubject: opts.conversation.subject,
-              messageId: mintTeamOutboundMessageId(opts.conversation.id) ?? undefined,
-              inReplyTo: teamRoot ?? undefined,
-              references: teamRoot ? [teamRoot] : undefined,
-              conversationId: opts.conversation.id,
-            })
-          )
-      )
-    }
+        )
+    )
   } catch (err) {
     log.warn({ err }, 'notify visitor message failed')
   }

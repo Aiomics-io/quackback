@@ -26,6 +26,8 @@ let limitQueue: Array<Record<string, unknown>[]> = []
 
 const isAnyAgentOnline = vi.fn<() => Promise<boolean>>()
 const isPrincipalOnline = vi.fn<(p: PrincipalId) => Promise<boolean>>()
+const batchGetNotificationPreferences =
+  vi.fn<(ids: PrincipalId[]) => Promise<Map<PrincipalId, Record<string, unknown>>>>()
 const buildHookContext =
   vi.fn<
     () => Promise<{ workspaceName: string; portalBaseUrl: string; logoUrl: string | null } | null>
@@ -43,6 +45,10 @@ vi.mock('@/lib/server/config', () => ({
 vi.mock('@/lib/server/realtime/presence', () => ({
   isAnyAgentOnline: (...a: []) => isAnyAgentOnline(...a),
   isPrincipalOnline: (...a: [PrincipalId]) => isPrincipalOnline(...a),
+}))
+
+vi.mock('@/lib/server/domains/subscriptions/subscription.service', () => ({
+  batchGetNotificationPreferences: (ids: PrincipalId[]) => batchGetNotificationPreferences(ids),
 }))
 
 vi.mock('@/lib/server/events/hook-context', () => ({
@@ -187,6 +193,7 @@ beforeEach(() => {
   // Silence the fire-and-forget warning logs.
   vi.spyOn(console, 'warn').mockImplementation(() => {})
   buildHookContext.mockResolvedValue(ctx)
+  batchGetNotificationPreferences.mockResolvedValue(new Map())
   // The shape every rung of the send layer actually returns. `undefined` is not
   // one of them, and defaulting to it would leave the caller's handling of a
   // reported Message-ID exercised by nothing.
@@ -216,9 +223,12 @@ describe('notifyVisitorMessage', () => {
   // events/__tests__/notification-handler.test.ts carry the ported
   // recipient/title/body assertions, plus the bell's own anti-spam presence
   // gate, which now runs in the notification hook's worker instead of here).
-  it('sends no email when an agent is online and it is not the first message', async () => {
+  it('emails the team even while an agent is online', async () => {
     isAnyAgentOnline.mockResolvedValue(true)
-    teamRows = [{ principalId: 'principal_admin', email: 'a@x.com', name: 'A' }]
+    teamRows = [
+      { principalId: 'principal_admin', email: 'a@x.com', name: 'A' },
+      { principalId: 'principal_member', email: 'm@x.com', name: 'M' },
+    ]
 
     await notifyVisitorMessage({
       conversation,
@@ -227,15 +237,49 @@ describe('notifyVisitorMessage', () => {
       isFirstMessage: false,
     })
 
-    expect(sendConversationMessageEmail).not.toHaveBeenCalled()
+    expect(sendConversationMessageEmail).toHaveBeenCalledTimes(2)
   })
 
-  it('sends no email on the first message while an agent is online', async () => {
-    isAnyAgentOnline.mockResolvedValue(true)
+  it('skips a teammate whose own New message email preference is off', async () => {
     teamRows = [
       { principalId: 'principal_admin', email: 'a@x.com', name: 'A' },
       { principalId: 'principal_member', email: 'm@x.com', name: 'M' },
     ]
+    batchGetNotificationPreferences.mockResolvedValue(
+      new Map([
+        [
+          'principal_admin' as PrincipalId,
+          {
+            emailStatusChange: true,
+            emailNewComment: true,
+            emailMuted: false,
+            matrix: { chat_message: { email: false } },
+          },
+        ],
+      ])
+    )
+
+    await notifyVisitorMessage({
+      conversation,
+      content: 'hello team',
+      authorName: 'Visitor',
+      isFirstMessage: true,
+    })
+
+    expect(sendConversationMessageEmail).toHaveBeenCalledTimes(1)
+    expect(sendConversationMessageEmail.mock.calls[0][0]).toMatchObject({ to: 'm@x.com' })
+  })
+
+  it('skips a teammate who paused all email', async () => {
+    teamRows = [{ principalId: 'principal_admin', email: 'a@x.com', name: 'A' }]
+    batchGetNotificationPreferences.mockResolvedValue(
+      new Map([
+        [
+          'principal_admin' as PrincipalId,
+          { emailStatusChange: true, emailNewComment: true, emailMuted: true },
+        ],
+      ])
+    )
 
     await notifyVisitorMessage({
       conversation,
@@ -247,8 +291,7 @@ describe('notifyVisitorMessage', () => {
     expect(sendConversationMessageEmail).not.toHaveBeenCalled()
   })
 
-  it('emails every team member with an address when no agent is online', async () => {
-    isAnyAgentOnline.mockResolvedValue(false)
+  it('emails every team member with an address', async () => {
     teamRows = [
       { principalId: 'principal_admin', email: 'a@x.com', name: 'A' },
       { principalId: 'principal_noemail', email: null, name: 'N' },
@@ -277,7 +320,6 @@ describe('notifyVisitorMessage', () => {
   })
 
   it('is a no-op when there are no team members', async () => {
-    isAnyAgentOnline.mockResolvedValue(false)
     teamRows = []
 
     await notifyVisitorMessage({
@@ -291,7 +333,8 @@ describe('notifyVisitorMessage', () => {
   })
 
   it('swallows a thrown dependency (does not reject)', async () => {
-    isAnyAgentOnline.mockRejectedValue(new Error('redis down'))
+    teamRows = [{ principalId: 'principal_admin', email: 'a@x.com', name: 'A' }]
+    batchGetNotificationPreferences.mockRejectedValue(new Error('db down'))
 
     await expect(
       notifyVisitorMessage({
