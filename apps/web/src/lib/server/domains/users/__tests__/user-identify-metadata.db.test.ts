@@ -1,6 +1,7 @@
 /**
  * Real-DB coverage for the metadata merge on an EXISTING user. Re-identifying
- * a known user with attributes (or updating one by principal) renders the
+ * a known user with attributes (via the API, the widget identify route, or by
+ * principal) renders the
  * `metadata - <removals>::text[]` expression, which Postgres only accepts when
  * the removal keys arrive as a real array — with no removals, with some, and
  * with both at once.
@@ -20,6 +21,7 @@ vi.mock('@/lib/server/cache', () => ({
 }))
 
 import { identifyPortalUser, updatePortalUser } from '../user.identify'
+import { mergedMetadataSql } from '../user.attributes'
 
 const fixture = await createDbTestFixture({
   probe: async (db) => {
@@ -83,6 +85,21 @@ describe.skipIf(!fixture.available)('identify metadata merge on an existing user
     const metadata = await readMetadata(again.userId)
     expect(metadata[planKey]).toBe('pro')
     expect(metadata).not.toHaveProperty(orgKey)
+  })
+
+  it('merges with no removals, as the widget identify route does', async () => {
+    const email = `meta-widget-${runSuffix()}@example.com`
+    const created = await identifyPortalUser({ email, attributes: { [planKey]: 'free' } })
+
+    await testDb
+      .update(user)
+      .set({ metadata: mergedMetadataSql([], { [orgKey]: 'Acme' }) })
+      .where(eq(user.id, created.userId as never))
+
+    expect(await readMetadata(created.userId)).toMatchObject({
+      [planKey]: 'free',
+      [orgKey]: 'Acme',
+    })
   })
 
   it('updates attributes by principal (updatePortalUser)', async () => {

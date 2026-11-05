@@ -5,7 +5,7 @@
  * updatePortalUser (update existing user by principal ID).
  */
 
-import { db, eq, and, principal, user, sql } from '@/lib/server/db'
+import { db, eq, and, principal, user } from '@/lib/server/db'
 import type { PrincipalId, UserId } from '@quackback/ids'
 import { generateId } from '@quackback/ids'
 import {
@@ -27,23 +27,8 @@ import {
   parseUserAttributes,
   extractExternalId,
   validateInputAttributes,
+  mergedMetadataSql,
 } from './user.attributes'
-
-/**
- * `metadata` with `removals` deleted and `updates` merged over the rest.
- *
- * The removal keys go in as an explicit `ARRAY[...]::text[]`: Drizzle's `sql`
- * template flattens a bare JS array into a parenthesised parameter list, so
- * `${keys}::text[]` rendered as `()::text[]` (a syntax error) for no removals
- * and `($1)::text[]` (a malformed array literal) for some.
- */
-function mergedMetadataSql(removals: string[], updates: Record<string, unknown>) {
-  const removalArray = sql`ARRAY[${sql.join(
-    removals.map((key) => sql`${key}`),
-    sql`, `
-  )}]::text[]`
-  return sql`((coalesce(nullif(${user.metadata}, ''), '{}')::jsonb - ${removalArray}) || ${JSON.stringify(updates)}::jsonb)::text`
-}
 
 /**
  * Identify (create or update) a portal user by email.
